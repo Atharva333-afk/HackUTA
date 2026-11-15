@@ -11,6 +11,111 @@ const {
   voice,
   inference,
 } = require("@livekit/agents");
+const elevenlabs = require("@livekit/agents-plugin-elevenlabs");
+
+// The ElevenLabs CLI stores the key as ELEVENLABS_API_KEY; the LiveKit plugin's
+// own default name is ELEVEN_API_KEY. Accept either so the key is set only once.
+const ELEVENLABS_API_KEY =
+  process.env.ELEVENLABS_API_KEY || process.env.ELEVEN_API_KEY;
+
+// George, a pre-made voice every ElevenLabs plan can use through the API.
+const ELEVENLABS_VOICE_ID =
+  process.env.ELEVENLABS_VOICE_ID ||
+  process.env.ELEVEN_VOICE_ID ||
+  "JBFqnCBsd6RMkjVDRZzb";
+
+// Speech -> text for the hearing person. ElevenLabs Scribe (realtime) by default;
+// set STT_PROVIDER=deepgram in .env.local to fall back to the original Deepgram setup.
+function createSpeechToText() {
+  if (process.env.STT_PROVIDER === "deepgram") {
+    console.log("Speech to text: Deepgram (fallback)");
+    return new inference.STT({
+      model: "deepgram/nova-3-general",
+      language: "en",
+    });
+  }
+
+  console.log("Speech to text: ElevenLabs Scribe realtime");
+  return new elevenlabs.STT({
+    apiKey: ELEVENLABS_API_KEY,
+    model: "scribe_v2_realtime",
+    languageCode: "en",
+    // Don't add sound tags like "(laughs)" to the captions.
+    tagAudioEvents: false,
+    // Scribe ends a sentence after ~1 second of silence, so each spoken
+    // sentence becomes one final transcript (walkie-talkie turns).
+    serverVad: { vadSilenceThresholdSecs: 1.0 },
+  });
+}
+
+// How often to check the shared server for new ASL translations (ms).
+const ASL_POLL_INTERVAL_MS = 1000;
+
+// Reads ASL -> English messages from the shared server and speaks each new one
+// into the call with the ElevenLabs voice. Returns a function that stops the loop.
+function startAslSpeaker(session) {
+  const baseUrl = process.env.SHARED_API_URL;
+  const token = process.env.SHARED_API_TOKEN;
+
+  if (!baseUrl || !token) {
+    console.log("SHARED_API_URL or SHARED_API_TOKEN missing; ASL voice is off.");
+    return () => {};
+  }
+
+  let lastId = null; // null until we skip the backlog from before this call
+  let stopped = false;
+  let busy = false;
+
+  const fetchAsl = async (after) => {
+    const response = await fetch(`${baseUrl}/messages/asl?after=${after}`, {
+      headers: { "X-API-Token": token },
+    });
+    if (!response.ok) {
+      throw new Error(`Shared server returned ${response.status}`);
+    }
+    return response.json();
+  };
+
+  const tick = async () => {
+    if (stopped || busy) return;
+    busy = true;
+    try {
+      if (lastId === null) {
+        // First run: do not read out messages sent before this call started.
+        const backlog = await fetchAsl(0);
+        lastId = backlog.length ? backlog[backlog.length - 1].id : 0;
+        return;
+      }
+
+      const fresh = await fetchAsl(lastId);
+      for (const message of fresh) {
+        lastId = message.id;
+        const text = message.clean_text?.trim();
+        if (!text) continue;
+
+        console.log("");
+        console.log("========== SPEAKING ASL ==========");
+        console.log(text);
+        console.log("==================================");
+
+        const handle = session.say(text, { allowInterruptions: false });
+        await handle.waitForPlayout();
+      }
+    } catch (error) {
+      console.error("ASL voice error:", error.message || error);
+    } finally {
+      busy = false;
+    }
+  };
+
+  const timer = setInterval(tick, ASL_POLL_INTERVAL_MS);
+  tick();
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
 
 
 
@@ -19,14 +124,13 @@ const agent = defineAgent({
     console.log("English Speaker agent received a call");
 
     const session = new voice.AgentSession({
-      stt: new inference.STT({
-        model: "deepgram/nova-3-general",
-        language: "en",
-      }),
+      stt: createSpeechToText(),
 
-      tts: new inference.TTS({
-        model: "cartesia/sonic-3",
-        voice: "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+      // ElevenLabs voice for the signer (sign -> voice).
+      tts: new elevenlabs.TTS({
+        apiKey: ELEVENLABS_API_KEY,
+        voiceId: ELEVENLABS_VOICE_ID,
+        model: process.env.ELEVENLABS_TTS_MODEL || "eleven_flash_v2_5",
         language: "en",
       }),
 
@@ -232,10 +336,15 @@ Do not use Markdown or code fences.`,
 
     await greeting.waitForPlayout();
 
+    // Sign -> voice: speak each new ASL translation into the call.
+    const stopAslSpeaker = startAslSpeaker(session);
+    ctx.addShutdownCallback(async () => stopAslSpeaker());
+
     console.log("");
     console.log("==========================================");
     console.log("ENGLISH SPEAKER AGENT READY");
-    console.log("FaceTime -> Speech -> Text -> FreeLLM");
+    console.log("FaceTime -> Scribe speech to text -> FreeLLM");
+    console.log("ASL text -> ElevenLabs voice -> FaceTime");
     console.log("Model chain: auto:asl-realtime");
     console.log("==========================================");
     console.log("");

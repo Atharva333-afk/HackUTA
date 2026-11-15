@@ -101,3 +101,13 @@ POST `/messages` with `X-API-Token`:
 ## Limits
 
 The API relay supports polling approximately once per second. Messages disappear on server restart and failed sends are not retried automatically. Gemini is not a dedicated ASL translation model; validate its output with fluent ASL signers. The short-clip webcam pipeline is not continuous or guaranteed accurate. Video is sent to Google's API; obtain consent. No avatar, TTS, or custom FaceTime caption rendering is included. The existing English voice agent still requires its own external services and credentials.
+
+## ElevenLabs (voice, Scribe, voicemail)
+
+The English agent uses ElevenLabs for both directions of audio:
+
+- **Sign -> voice:** each new ASL translation on the shared server is spoken into the call (`eleven_flash_v2_5`, low latency).
+- **Speech -> text:** the hearing person's speech is transcribed with Scribe realtime (`scribe_v2_realtime`). Set `STT_PROVIDER=deepgram` in `.env.local` to fall back to the original Deepgram setup.
+- **Signed voicemail:** `node voicemail.js "text"` or `node voicemail.js --latest` saves an `.mp3` in `voicemails/` (`eleven_v4`, most expressive). Add `--play` to hear it. Send it by dragging the file into Messages.
+
+Setup: `npm install`, then put `ELEVENLABS_API_KEY=` in `.env.local` (run `npx -y @elevenlabs/cli@latest onboard init` to create the file). Optional: `ELEVENLABS_VOICE_ID` (defaults to George, a pre-made voice every plan can use).
