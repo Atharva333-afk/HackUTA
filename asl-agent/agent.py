@@ -15,6 +15,7 @@ from livekit import rtc
 from livekit.agents import AgentServer, JobContext, AutoSubscribe, cli
 
 from shared_api import send_translation
+from captions import CaptionBoard, publish_captions, poll_english_replies
 
 load_dotenv(Path(__file__).with_name(".env"))
 
@@ -121,7 +122,7 @@ def encode_video(frames):
         return path.read_bytes()
 
 
-async def process_clip(client, frames):
+async def process_clip(client, frames, board):
     try:
         log.info("Sending %s frames to Gemini", len(frames))
 
@@ -142,6 +143,9 @@ async def process_clip(client, frames):
 
         log.info("ASL translation: %s", result["clean_text"])
 
+        # Show the signer how their signing was understood.
+        board.set_you_signed(result["clean_text"])
+
         sent = await asyncio.to_thread(
             send_translation,
             result,
@@ -153,7 +157,7 @@ async def process_clip(client, frames):
         log.exception("ASL translation failed")
 
 
-async def read_video(track, client):
+async def read_video(track, client, board):
     stream = rtc.VideoStream(
         track,
         format=rtc.VideoBufferType.RGB24,
@@ -196,7 +200,7 @@ async def read_video(track, client):
                 clip_started = now
 
                 asyncio.create_task(
-                    process_clip(client, clip)
+                    process_clip(client, clip, board)
                 )
 
     finally:
@@ -213,6 +217,7 @@ async def entrypoint(ctx: JobContext):
     client = genai.Client(api_key=key)
 
     tasks = {}
+    board = CaptionBoard()
 
     @ctx.room.on("track_subscribed")
     def on_track(track, publication, participant):
@@ -226,7 +231,7 @@ async def entrypoint(ctx: JobContext):
             log.info("Phone video connected")
 
             tasks[publication.sid] = asyncio.create_task(
-                read_video(track, client)
+                read_video(track, client, board)
             )
 
     @ctx.room.on("track_unsubscribed")
@@ -251,6 +256,14 @@ async def entrypoint(ctx: JobContext):
 
     await ctx.connect(
         auto_subscribe=AutoSubscribe.SUBSCRIBE_ALL
+    )
+
+    # Voice -> sign side: the signer sees English replies as captions on FaceTime.
+    tasks["captions"] = asyncio.create_task(
+        publish_captions(ctx.room, board)
+    )
+    tasks["english-replies"] = asyncio.create_task(
+        poll_english_replies(board)
     )
 
     log.info(
