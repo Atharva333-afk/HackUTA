@@ -48,6 +48,93 @@ function createSpeechToText() {
   });
 }
 
+const INTENTS = ["statement", "question", "command", "greeting", "other"];
+
+// Message for the signer built straight from the Scribe transcript.
+function passThrough(transcript) {
+  return {
+    source: "english",
+    original_text: transcript,
+    clean_text: transcript,
+    intent: transcript.endsWith("?") ? "question" : "statement",
+  };
+}
+
+// Asks FreeLLM to tidy the transcript. Returns null when FreeLLM isn't set up,
+// errors, or returns something unusable, so the caller can fall back.
+async function cleanWithFreeLLM(transcript) {
+  if (!process.env.FREELLM_API_KEY || !process.env.FREELLM_BASE_URL) {
+    console.log("FreeLLM not configured; sending the transcript as-is.");
+    return null;
+  }
+
+  try {
+    console.log(">>> CALLING FREELLM NOW");
+
+    const messages = [
+      {
+        role: "system",
+        content: `You are the language-processing layer of a real-time accessibility system helping an English speaker communicate with an ASL user.
+
+Do not answer the speaker.
+
+Return ONLY valid JSON using exactly:
+{
+  "source": "english",
+  "original_text": "...",
+  "clean_text": "...",
+  "intent": "..."
+}
+
+Preserve the original meaning.
+Remove filler or accidental repetition only when appropriate.
+Do not invent information.
+
+Intent must be exactly one of:
+"statement", "question", "command", "greeting", "other".
+
+Do not use Markdown or code fences.`,
+      },
+      { role: "user", content: transcript },
+    ];
+
+    const { stdout } = await execFileAsync("curl", [
+      "--max-time", "12",
+      "-sS",
+      "-H", "Authorization: Bearer " + process.env.FREELLM_API_KEY,
+      "-H", "Content-Type: application/json",
+      process.env.FREELLM_BASE_URL + "/chat/completions",
+      "-d", JSON.stringify({
+        model: "gemini-3.6-flash",
+        messages,
+        temperature: 0.1,
+      }),
+    ]);
+
+    const response = JSON.parse(stdout);
+    if (response.error) {
+      throw new Error(response.error.message || "FreeLLM provider error");
+    }
+
+    const result = response.choices?.[0]?.message?.content?.trim();
+    if (!result) throw new Error("FreeLLM returned an empty response");
+
+    const parsed = JSON.parse(result);
+    const clean = String(parsed.clean_text || "").trim();
+    if (!clean) throw new Error("FreeLLM returned no clean_text");
+
+    return {
+      source: "english",
+      original_text: String(parsed.original_text || transcript).trim(),
+      clean_text: clean,
+      intent: INTENTS.includes(parsed.intent) ? parsed.intent : "other",
+    };
+  } catch (error) {
+    console.error("FreeLLM failed, sending the transcript as-is:", error.message || error);
+    return null;
+  }
+}
+
 // How often to check the shared server for new ASL translations (ms).
 const ASL_POLL_INTERVAL_MS = 1000;
 
@@ -156,155 +243,49 @@ const agent = defineAgent({
         console.log("================================");
         console.log("");
 
+        // FreeLLM tidies the transcript when it's configured; otherwise (or if it
+        // fails) the Scribe transcript is sent to the signer as-is.
+        const structuredMessage =
+          (await cleanWithFreeLLM(transcript)) || passThrough(transcript);
+
+        console.log("========== ASL MESSAGE ==========");
+        console.log("Original:", structuredMessage.original_text);
+        console.log("Clean:", structuredMessage.clean_text);
+        console.log("Intent:", structuredMessage.intent);
+        console.log("=================================");
+        console.log("");
+
         try {
-          console.log(">>> CALLING FREELLM NOW");
-
-          const messages = [
-            {
-              role: "system",
-              content: `You are the language-processing layer of a real-time accessibility system helping an English speaker communicate with an ASL user.
-
-Do not answer the speaker.
-
-Return ONLY valid JSON using exactly:
-{
-  "source": "english",
-  "original_text": "...",
-  "clean_text": "...",
-  "intent": "..."
-}
-
-Preserve the original meaning.
-Remove filler or accidental repetition only when appropriate.
-Do not invent information.
-
-Intent must be exactly one of:
-"statement", "question", "command", "greeting", "other".
-
-Do not use Markdown or code fences.`,
-            },
-            {
-              role: "user",
-              content: transcript,
-            },
-          ];
-
-          const { stdout } = await execFileAsync("curl", [
-            "--max-time", "12",
-            "-sS",
-            "-H", "Authorization: Bearer " + process.env.FREELLM_API_KEY,
-            "-H", "Content-Type: application/json",
-            process.env.FREELLM_BASE_URL + "/chat/completions",
-            "-d", JSON.stringify({
-              model: "gemini-3.6-flash",
-              messages,
-              temperature: 0.1,
-            }),
-          ]);
-
-          const response = JSON.parse(stdout);
-
-          if (response.error) {
-            throw new Error(response.error.message || "FreeLLM provider error");
-          }
-
-          const result =
-            response.choices?.[0]?.message?.content?.trim();
-
-          if (!result) {
-            console.log("FreeLLM returned an empty response.");
-            return;
-          }
-
-          console.log("========== FREELLM ==========");
-          console.log(result);
-          console.log("=============================");
-          console.log("");
-
-          try {
-            const structuredMessage = JSON.parse(result);
-
-            console.log("========== ASL MESSAGE ==========");
-            console.log(
-              "Original:",
-              structuredMessage.original_text
-            );
-
-            console.log(
-              "Clean:",
-              structuredMessage.clean_text
-            );
-
-            console.log(
-              "Intent:",
-              structuredMessage.intent
-            );
-
-            console.log("=================================");
-            console.log("");
-
-            const payload = new TextEncoder().encode(
-              JSON.stringify(structuredMessage)
-            );
-
-            await ctx.room.localParticipant.publishData(payload, {
-              reliable: true,
-              topic: "english-to-asl",
-            });
-
-            console.log("Sent message to ASL channel.");
-
-            try {
-              const response = await fetch(
-                `${process.env.SHARED_API_URL}/messages`,
-                {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "X-API-Token": process.env.SHARED_API_TOKEN,
-                  },
-                  body: JSON.stringify(structuredMessage),
-                }
-              );
-
-              const sharedResult = await response.json();
-              console.log("Sent message to shared backend:", sharedResult);
-            } catch (error) {
-              console.error("Shared backend error:", error.message);
-            }
-            console.log("");
-
-            /*
-              NEXT STEP:
-
-              structuredMessage contains:
-
-              {
-                source: "english",
-                original_text: "...",
-                clean_text: "...",
-                intent: "..."
-              }
-
-              Later this will be sent to the ASL-side agent.
-            */
-
-          } catch (jsonError) {
-            console.error("");
-            console.error("========== JSON ERROR ==========");
-            console.error("FreeLLM returned invalid JSON.");
-            console.error(result);
-            console.error("================================");
-            console.error("");
-          }
-
+          const payload = new TextEncoder().encode(
+            JSON.stringify(structuredMessage)
+          );
+          await ctx.room.localParticipant.publishData(payload, {
+            reliable: true,
+            topic: "english-to-asl",
+          });
+          console.log("Sent message to ASL channel.");
         } catch (error) {
-          console.error("");
-          console.error("========== FREELLM ERROR ==========");
-          console.error(error.message || error);
-          console.error("===================================");
-          console.error("");
+          console.error("ASL channel error:", error.message || error);
         }
+
+        try {
+          const response = await fetch(
+            `${process.env.SHARED_API_URL}/messages`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-API-Token": process.env.SHARED_API_TOKEN,
+              },
+              body: JSON.stringify(structuredMessage),
+            }
+          );
+          const sharedResult = await response.json();
+          console.log("Sent message to shared backend:", sharedResult);
+        } catch (error) {
+          console.error("Shared backend error:", error.message);
+        }
+        console.log("");
       }
     );
 

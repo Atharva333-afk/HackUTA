@@ -111,3 +111,17 @@ The English agent uses ElevenLabs for both directions of audio:
 - **Signed voicemail:** `node voicemail.js "text"` or `node voicemail.js --latest` saves an `.mp3` in `voicemails/` (`eleven_v4`, most expressive). Add `--play` to hear it. Send it by dragging the file into Messages.
 
 Setup: `npm install`, then put `ELEVENLABS_API_KEY=` in `.env.local` (run `npx -y @elevenlabs/cli@latest onboard init` to create the file). Optional: `ELEVENLABS_VOICE_ID` (defaults to George, a pre-made voice every plan can use).
+
+## Demo settings and tools
+
+- **FreeLLM is optional.** Without `FREELLM_API_KEY`/`FREELLM_BASE_URL`, or if FreeLLM fails, the English agent sends the Scribe transcript to the signer as-is.
+- **ASL agent settings** (environment variables, all optional):
+  - `ASL_AGENT_NAME`: run the agent under a unique name (e.g. `asl-agent-yael`) so dispatches reach only your machine.
+  - `MIN_MOTION` (default 3): how much movement starts a sign. Lower if signs are missed, raise if still moments trigger clips.
+  - `SIGN_VOCAB` (default `YES,NO,PLEASE,THANK YOU,SORRY,HELP`): signs Gemini is told to expect.
+  - `GEMINI_FALLBACK_MODELS`: models tried in order when one is overloaded or out of quota.
+  - `GEMINI_MIN_INTERVAL` (default 13 s): spacing between Gemini requests for free-tier keys.
+- **Signing detection:** a clip starts when the hands move and ends after 1 s of stillness. Sign one sign, drop your hands, and wait for the screen to show SIGN NOW again.
+- **Caption screen status:** SIGN NOW (green), SIGNING (blue), TRANSLATING (amber), WAIT (grey countdown).
+- **`node reply.js reply.m4a`** transcribes a recorded reply with ElevenLabs Scribe and sends it to the signer; `node reply.js --text "..."` sends typed text.
+- **Browser demo (no FaceTime):** join rooms from meet.livekit.io with `lk token create`, then send agents in with `lk dispatch create --room <room> --agent-name <name>`. Join the room first, then dispatch.

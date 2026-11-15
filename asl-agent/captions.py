@@ -29,6 +29,13 @@ MUTED = (150, 160, 180)
 
 FONT = cv2.FONT_HERSHEY_DUPLEX
 
+STATUS_COLORS = {             # RGB
+    "ready": (40, 160, 90),       # green
+    "signing": (50, 110, 210),    # blue
+    "translating": (225, 140, 30),# amber
+    "wait": (100, 110, 130),      # grey
+}
+
 
 class CaptionBoard:
     """Holds what the signer should see and draws it as RGBA frames."""
@@ -37,6 +44,8 @@ class CaptionBoard:
         self.reply = ""            # latest English reply for the signer
         self.reply_at = 0.0
         self.you_signed = ""       # how the signer's last clip was translated
+        self.status = "ready"      # ready | signing | translating
+        self.wait_until = 0.0      # Gemini cooldown end (time.monotonic)
 
     def set_reply(self, text):
         self.reply = text.strip()
@@ -45,36 +54,61 @@ class CaptionBoard:
     def set_you_signed(self, text):
         self.you_signed = text.strip()
 
+    def set_status(self, status, wait_until=None):
+        self.status = status
+        if wait_until is not None:
+            self.wait_until = wait_until
+
+    def _status_view(self):
+        """(title, hint, color) telling the signer what to do right now."""
+        if self.status == "signing":
+            return "SIGNING...", "Drop your hands when done", STATUS_COLORS["signing"]
+        if self.status == "translating":
+            return "TRANSLATING...", "Hold still", STATUS_COLORS["translating"]
+        wait = self.wait_until - time.monotonic()
+        if wait > 0.5:
+            return f"WAIT {int(wait + 0.99)}s", "Then sign again", STATUS_COLORS["wait"]
+        return "SIGN NOW", "One sign, then hands down", STATUS_COLORS["ready"]
+
     def render(self):
         img = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
         img[:] = BACKGROUND
 
-        _draw_text(img, "THEY SAID", 60, 110, 0.9, ACCENT, 2)
-        cv2.line(img, (60, 135), (WIDTH - 60, 135), ACCENT, 2)
+        # Status banner + matching screen border: what the signer should do now.
+        title, hint, color = self._status_view()
+        cv2.rectangle(img, (0, 0), (WIDTH - 1, HEIGHT - 1), color, 18)
+        cv2.rectangle(img, (40, 50), (WIDTH - 40, 190), color, -1)
+        _draw_text(img, title, 70, 125, 1.8, TEXT, 4)
+        _draw_text(img, hint, 72, 170, 0.9, TEXT, 2)
+
+        _draw_text(img, "THEY SAID", 60, 260, 1.0, ACCENT, 2)
+        cv2.line(img, (60, 285), (WIDTH - 60, 285), ACCENT, 2)
 
         if self.reply:
             # Larger text for short replies, smaller for long ones.
             scale = 2.0 if len(self.reply) <= 60 else 1.4
             line_height = int(cv2.getTextSize("Ag", FONT, scale, 3)[0][1] * 1.9)
-            y = 160 + line_height
-            for line in _wrap_to_width(self.reply, WIDTH - 120, scale, 3)[:9]:
+            y = 300 + line_height
+            for line in _wrap_to_width(self.reply, WIDTH - 120, scale, 3)[:4]:
                 _draw_text(img, line, 60, y, scale, TEXT, 3)
                 y += line_height
 
             # Highlight new replies for 3 seconds.
             if time.monotonic() - self.reply_at < 3:
-                cv2.rectangle(img, (40, 160), (WIDTH - 40, y), ACCENT, 3)
+                cv2.rectangle(img, (40, 300), (WIDTH - 40, min(y, HEIGHT // 2 + 40)), ACCENT, 3)
         else:
-            _draw_text(img, "Waiting for a reply...", 60, 230, 1.1, MUTED, 2)
+            _draw_text(img, "Waiting for a reply...", 60, 360, 1.1, MUTED, 2)
 
         if self.you_signed:
-            y = HEIGHT - 260
-            cv2.line(img, (60, y - 50), (WIDTH - 60, y - 50), MUTED, 1)
-            _draw_text(img, "YOU SIGNED", 60, y, 0.8, MUTED, 2)
-            y += 55
-            for line in _wrap_to_width(self.you_signed, WIDTH - 120, 1.0, 2)[:3]:
-                _draw_text(img, line, 60, y, 1.0, TEXT, 2)
-                y += 50
+            # Kept in the middle of the screen: video tiles often crop the
+            # top and bottom of a tall video.
+            y = HEIGHT // 2 + 120
+            cv2.line(img, (60, y - 55), (WIDTH - 60, y - 55), MUTED, 2)
+            _draw_text(img, "YOU SIGNED", 60, y, 1.0, ACCENT, 2)
+            y += 75
+            for line in _wrap_to_width(self.you_signed, WIDTH - 120, 1.5, 3)[:3]:
+                _draw_text(img, line, 60, y, 1.5, TEXT, 3)
+                y += 70
 
         return cv2.cvtColor(img, cv2.COLOR_RGB2RGBA)
 

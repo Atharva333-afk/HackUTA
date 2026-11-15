@@ -26,6 +26,17 @@ server = AgentServer()
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 CLIP_SECONDS = 5
+
+# Skip clips with little movement so Gemini's quota is only spent on signing.
+# Average pixel change between frames (0-255). Raise to skip more, lower to send more.
+MIN_MOTION = float(os.getenv("MIN_MOTION", "3"))
+
+# Free-tier Gemini keys allow few requests per minute, so space them out.
+GEMINI_MIN_INTERVAL = float(os.getenv("GEMINI_MIN_INTERVAL", "13"))
+_next_gemini_at = 0.0
+
+# Frames are shrunk to this width before storing, to save memory and upload size.
+MAX_FRAME_WIDTH = 640
 TARGET_FPS = 8
 
 INTENTS = {
@@ -48,7 +59,7 @@ Do not invent missing information.
 
 If the signing is unclear, incomplete, or cannot be translated reliably,
 return empty original_text and clean_text and intent "other".
-
+{vocab}
 Return only JSON with:
 source: "asl"
 original_text: literal English translation
@@ -56,10 +67,62 @@ clean_text: natural English with the same meaning
 intent: one of statement, question, command, greeting, other
 """
 
+# Signs the demo expects. Telling Gemini what to expect makes it far more
+# accurate on a small vocabulary. Override with SIGN_VOCAB="HELLO,THANK YOU,...".
+SIGN_VOCAB = [
+    w.strip()
+    for w in os.getenv("SIGN_VOCAB", "YES,NO,PLEASE,THANK YOU,SORRY,HELP").split(",")
+    if w.strip()
+]
+PROMPT = PROMPT.format(
+    vocab=(
+        "\nThe signer will most likely use one of these signs: "
+        + ", ".join(SIGN_VOCAB)
+        + ". If the signing matches one of them, use that meaning. "
+        "A clip usually contains a single sign.\n"
+    )
+    if SIGN_VOCAB
+    else ""
+)
+
+
+# If a model is overloaded (503) or unavailable (404), try these next, in order.
+FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview,"
+        "gemini-3.5-flash-lite,gemini-3.1-flash-lite",
+    ).split(",")
+    if m.strip()
+]
+
 
 def translate_video(client, video_bytes):
-    response = client.models.generate_content(
-        model=MODEL,
+    last_error = None
+    for model in [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]:
+        try:
+            response = _generate(client, model, video_bytes)
+            break
+        except Exception as error:
+            text = str(error)
+            # Each model has its own quota, so on overload, missing model or
+            # quota errors, try the next model before giving up.
+            if any(code in text for code in ("503", "UNAVAILABLE", "404", "NOT_FOUND", "429", "RESOURCE_EXHAUSTED")):
+                log.warning("Gemini model %s unavailable (%s), trying next", model, text[:40])
+                if last_error is None or "404" in str(last_error) or "NOT_FOUND" in str(last_error):
+                    last_error = error
+                continue
+            raise
+    else:
+        raise last_error
+
+    return _parse_result(response)
+
+
+def _generate(client, model, video_bytes):
+    return client.models.generate_content(
+        model=model,
         contents=types.Content(
             parts=[
                 types.Part(
@@ -77,6 +140,9 @@ def translate_video(client, video_bytes):
         ),
     )
 
+
+
+def _parse_result(response):
     result = json.loads(response.text or "{}")
 
     original = result.get("original_text", "")
@@ -122,9 +188,33 @@ def encode_video(frames):
         return path.read_bytes()
 
 
-async def process_clip(client, frames, board):
+def clip_motion(frames):
+    """Average change between consecutive frames, on small grayscale copies."""
+    if len(frames) < 2:
+        return 0.0
+    small = [
+        cv2.cvtColor(cv2.resize(f, (160, 120)), cv2.COLOR_BGR2GRAY).astype(np.int16)
+        for f in frames
+    ]
+    diffs = [np.abs(b - a).mean() for a, b in zip(small, small[1:])]
+    return float(np.mean(diffs))
+
+
+async def process_clip(client, frames, board, check_motion=True):
+    global _next_gemini_at
     try:
-        log.info("Sending %s frames to Gemini", len(frames))
+        motion = clip_motion(frames)
+        if check_motion and motion < MIN_MOTION:
+            log.info("Skipping still clip (motion %.1f < %.1f)", motion, MIN_MOTION)
+            return
+
+        now = time.monotonic()
+        if now < _next_gemini_at:
+            log.info("Waiting %.0fs for Gemini rate limit; skipping clip", _next_gemini_at - now)
+            return
+        _next_gemini_at = now + GEMINI_MIN_INTERVAL
+
+        log.info("Sending %s frames to Gemini (motion %.1f)", len(frames), motion)
 
         video_bytes = await asyncio.to_thread(
             encode_video,
@@ -153,8 +243,28 @@ async def process_clip(client, frames, board):
 
         log.info("Sent ASL translation to shared backend: %s", sent)
 
-    except Exception:
-        log.exception("ASL translation failed")
+    except Exception as error:
+        if "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error):
+            # Google asked us to slow down: pause before the next request.
+            _next_gemini_at = time.monotonic() + 30
+            log.warning("Gemini rate limit hit; pausing 30s. %s", str(error)[:160])
+        else:
+            log.exception("ASL translation failed")
+    finally:
+        # Back to "sign now", showing any Gemini cooldown as a countdown.
+        board.set_status("ready", wait_until=_next_gemini_at)
+
+
+# Signing detection: a clip starts when the hands start moving and ends after
+# STOP_STILL_SECONDS of stillness, so a sign is never cut in half.
+STOP_STILL_SECONDS = 1.0
+PRE_ROLL_FRAMES = 4          # keep ~0.5 s from just before movement started
+MIN_CLIP_SECONDS = 0.8
+MAX_CLIP_SECONDS = 6.0
+
+
+def _small_gray(frame):
+    return cv2.cvtColor(cv2.resize(frame, (160, 120)), cv2.COLOR_BGR2GRAY).astype(np.int16)
 
 
 async def read_video(track, client, board):
@@ -164,8 +274,13 @@ async def read_video(track, client, board):
         capacity=1,
     )
 
-    frames = []
-    clip_started = time.monotonic()
+    recent = []          # rolling pre-roll buffer while idle
+    clip = []            # frames of the sign being recorded
+    recording = False
+    clip_started = 0.0
+    still_since = None
+    prev_small = None
+    smooth = 0.0
     last_frame_time = 0
 
     try:
@@ -192,22 +307,58 @@ async def read_video(track, client, board):
             # OpenCV VideoWriter expects BGR
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-            frames.append(bgr.copy())
+            height, width = bgr.shape[:2]
+            if width > MAX_FRAME_WIDTH:
+                scale = MAX_FRAME_WIDTH / width
+                bgr = cv2.resize(bgr, (MAX_FRAME_WIDTH, int(height * scale)))
+            bgr = bgr.copy()
 
-            if now - clip_started >= CLIP_SECONDS:
-                clip = frames
-                frames = []
-                clip_started = now
+            small = _small_gray(bgr)
+            motion = 0.0 if prev_small is None else float(np.abs(small - prev_small).mean())
+            prev_small = small
+            smooth = 0.6 * smooth + 0.4 * motion  # damp camera noise
 
-                asyncio.create_task(
-                    process_clip(client, clip, board)
-                )
+            if not recording:
+                recent.append(bgr)
+                recent = recent[-PRE_ROLL_FRAMES:]
+                if smooth >= MIN_MOTION:
+                    recording = True
+                    clip = list(recent)
+                    clip_started = now
+                    still_since = None
+                    log.info("Signing started (motion %.1f)", smooth)
+                    board.set_status("signing")
+                continue
+
+            clip.append(bgr)
+            if smooth < MIN_MOTION:
+                still_since = still_since or now
+            else:
+                still_since = None
+
+            ended = still_since is not None and now - still_since >= STOP_STILL_SECONDS
+            too_long = now - clip_started >= MAX_CLIP_SECONDS
+            if ended or too_long:
+                length = now - clip_started
+                recording = False
+                recent = []
+                if length >= MIN_CLIP_SECONDS:
+                    log.info("Sign finished: %.1fs clip", length)
+                    board.set_status("translating")
+                    asyncio.create_task(
+                        process_clip(client, clip, board, check_motion=False)
+                    )
+                else:
+                    log.info("Ignoring very short movement (%.1fs)", length)
+                    board.set_status("ready")
+                clip = []
 
     finally:
         await stream.aclose()
 
 
-@server.rtc_session(agent_name="asl-agent")
+# Set ASL_AGENT_NAME to run under a different name (e.g. so dispatches reach only this machine).
+@server.rtc_session(agent_name=os.getenv("ASL_AGENT_NAME", "asl-agent"))
 async def entrypoint(ctx: JobContext):
     key = os.getenv("GEMINI_API_KEY")
 
