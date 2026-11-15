@@ -1,6 +1,6 @@
 # HackUTA — ASL / English caption exchange
 
-A minimal two-language codebase: Python translates short signing videos with Gemini and displays English captions; the existing Node.js agent transcribes English speech with Deepgram/LiveKit and cleans it using FreeLLM. Both exchange JSON through one FastAPI server. No training, avatar or TTS is included.
+A minimal two-language codebase: Python translates short signing videos with Gemini and displays English captions; the Node.js agent transcribes English speech with ElevenLabs Scribe, cleans it using FreeLLM, and speaks each ASL translation into the call with an ElevenLabs voice. Both exchange JSON through one FastAPI server. A `voicemail.js` script turns signed messages into ElevenLabs voice clips. No training or avatar is included.
 
 ## 1. Open this folder in Visual Studio
 
@@ -58,7 +58,7 @@ npm ci
 Copy-Item .env.local.example .env.local
 ```
 
-Fill in the teammate's existing LiveKit and FreeLLM settings, shared URL and token. Their original Deepgram/LiveKit inference setup is preserved and needs a working LiveKit inference configuration. Their FreeLLM model string is also unchanged.
+Fill in the teammate's existing LiveKit and FreeLLM settings, shared URL and token. Speech to text now uses ElevenLabs Scribe, so add `ELEVENLABS_API_KEY` to `.env.local` (see the ElevenLabs section below). The original Deepgram/LiveKit setup is kept as a fallback (`STT_PROVIDER=deepgram`) and needs a working LiveKit inference configuration. Their FreeLLM model string is also unchanged.
 
 Test the connection without Chert or FreeLLM:
 
@@ -78,7 +78,7 @@ The Python webcam window should display the English reply. To start the original
 node agent.js dev
 ```
 
-It registers as `english-speaker-agent`. Keep your teammate's existing Chert setup for dispatching it. The receiver is a separate process deliberately, to avoid changing the LiveKit voice lifecycle. It displays text only, not audio.
+It registers as `english-speaker-agent`. Keep your teammate's existing Chert setup for dispatching it. The receiver is a separate process deliberately, to avoid changing the LiveKit voice lifecycle. It displays text only, not audio. The agent itself (`agent.js`) speaks each ASL translation aloud into the call.
 
 ## 5. Different laptops
 
@@ -100,7 +100,7 @@ POST `/messages` with `X-API-Token`:
 
 ## Limits
 
-The API relay supports polling approximately once per second. Messages disappear on server restart and failed sends are not retried automatically. Gemini is not a dedicated ASL translation model; validate its output with fluent ASL signers. The short-clip webcam pipeline is not continuous or guaranteed accurate. Video is sent to Google's API; obtain consent. No avatar, TTS, or custom FaceTime caption rendering is included. The existing English voice agent still requires its own external services and credentials.
+The API relay supports polling approximately once per second. Messages disappear on server restart and failed sends are not retried automatically. Gemini is not a dedicated ASL translation model; validate its output with fluent ASL signers. The short-clip webcam pipeline is not continuous or guaranteed accurate. Video is sent to Google's API; obtain consent. No avatar or custom FaceTime caption rendering is included. The English voice agent requires its own credentials, including an ElevenLabs API key, and ElevenLabs usage spends that account's credits.
 
 ## ElevenLabs (voice, Scribe, voicemail)
 
