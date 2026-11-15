@@ -4,15 +4,19 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "agent": "node agent.js dev",
+    "voicemail": "node voicemail.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@elevenlabs/elevenlabs-js": "^2.78.0",
     "@google/genai": "^3.3.0",
     "@livekit/agents": "^1.10.0",
+    "@livekit/agents-plugin-elevenlabs": "^1.10.0",
     "dotenv": "^18.0.10",
     "openai": "^7.57.0"
   }
