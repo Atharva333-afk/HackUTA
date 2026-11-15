@@ -1,6 +1,8 @@
 require("dotenv").config({ path: ".env.local" });
 
-const OpenAI = require("openai");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
+const execFileAsync = promisify(execFile);
 
 const {
   cli,
@@ -10,10 +12,7 @@ const {
   inference,
 } = require("@livekit/agents");
 
-const client = new OpenAI({
-  apiKey: process.env.FREELLM_API_KEY,
-  baseURL: process.env.FREELLM_BASE_URL,
-});
+
 
 const agent = defineAgent({
   entry: async (ctx) => {
@@ -22,6 +21,12 @@ const agent = defineAgent({
     const session = new voice.AgentSession({
       stt: new inference.STT({
         model: "deepgram/nova-3-general",
+        language: "en",
+      }),
+
+      tts: new inference.TTS({
+        model: "cartesia/sonic-3",
+        voice: "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
         language: "en",
       }),
 
@@ -48,36 +53,16 @@ const agent = defineAgent({
         console.log("");
 
         try {
-          const response = await client.chat.completions.create({
-            model: "auto:asl-realtime",
+          console.log(">>> CALLING FREELLM NOW");
 
-            messages: [
-              {
-                role: "system",
-                content: `
-You are the language-processing layer of a real-time accessibility
-system that helps an English-speaking person communicate with an
-American Sign Language user.
+          const messages = [
+            {
+              role: "system",
+              content: `You are the language-processing layer of a real-time accessibility system helping an English speaker communicate with an ASL user.
 
-Your job is NOT to answer the English speaker.
+Do not answer the speaker.
 
-Your job is to understand exactly what the speaker said and prepare
-a clean structured message that can later be sent to the ASL side
-of the system.
-
-Preserve the speaker's original meaning.
-
-Remove speech disfluencies only when they do not affect meaning,
-such as filler words, false starts, or accidental repetition.
-
-Do not invent information.
-
-Do not unnecessarily rewrite simple sentences.
-
-Return ONLY valid JSON.
-
-Use exactly this JSON structure:
-
+Return ONLY valid JSON using exactly:
 {
   "source": "english",
   "original_text": "...",
@@ -85,40 +70,39 @@ Use exactly this JSON structure:
   "intent": "..."
 }
 
-Rules:
+Preserve the original meaning.
+Remove filler or accidental repetition only when appropriate.
+Do not invent information.
 
-"original_text"
-- Preserve the original transcript.
+Intent must be exactly one of:
+"statement", "question", "command", "greeting", "other".
 
-"clean_text"
-- Produce the clearest natural-English version of the same message.
-- Keep the meaning unchanged.
-- Remove unnecessary filler words when appropriate.
+Do not use Markdown or code fences.`,
+            },
+            {
+              role: "user",
+              content: transcript,
+            },
+          ];
 
-"intent"
-Choose exactly one of these:
+          const { stdout } = await execFileAsync("curl", [
+            "--max-time", "12",
+            "-sS",
+            "-H", "Authorization: Bearer " + process.env.FREELLM_API_KEY,
+            "-H", "Content-Type: application/json",
+            process.env.FREELLM_BASE_URL + "/chat/completions",
+            "-d", JSON.stringify({
+              model: "gemini-3.6-flash",
+              messages,
+              temperature: 0.1,
+            }),
+          ]);
 
-"statement"
-"question"
-"command"
-"greeting"
-"other"
+          const response = JSON.parse(stdout);
 
-Do not use Markdown.
-Do not use code fences.
-Do not provide explanations.
-Do not put anything before or after the JSON object.
-                `.trim(),
-              },
-
-              {
-                role: "user",
-                content: transcript,
-              },
-            ],
-
-            temperature: 0.1,
-          });
+          if (response.error) {
+            throw new Error(response.error.message || "FreeLLM provider error");
+          }
 
           const result =
             response.choices?.[0]?.message?.content?.trim();
@@ -153,6 +137,37 @@ Do not put anything before or after the JSON object.
             );
 
             console.log("=================================");
+            console.log("");
+
+            const payload = new TextEncoder().encode(
+              JSON.stringify(structuredMessage)
+            );
+
+            await ctx.room.localParticipant.publishData(payload, {
+              reliable: true,
+              topic: "english-to-asl",
+            });
+
+            console.log("Sent message to ASL channel.");
+
+            try {
+              const response = await fetch(
+                `${process.env.SHARED_API_URL}/messages`,
+                {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "X-API-Token": process.env.SHARED_API_TOKEN,
+                  },
+                  body: JSON.stringify(structuredMessage),
+                }
+              );
+
+              const sharedResult = await response.json();
+              console.log("Sent message to shared backend:", sharedResult);
+            } catch (error) {
+              console.error("Shared backend error:", error.message);
+            }
             console.log("");
 
             /*
@@ -210,6 +225,12 @@ Do not put anything before or after the JSON object.
     });
 
     await ctx.connect();
+
+    const greeting = session.say("Hi, I am ready.", {
+      allowInterruptions: false,
+    });
+
+    await greeting.waitForPlayout();
 
     console.log("");
     console.log("==========================================");
